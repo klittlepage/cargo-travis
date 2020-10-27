@@ -1,24 +1,16 @@
-extern crate cargo;
-extern crate cargo_travis;
-extern crate docopt;
-extern crate env_logger;
-#[macro_use]
-extern crate failure;
-#[macro_use]
-extern crate serde_derive;
-#[macro_use]
-extern crate log;
+use log::debug;
 
+use anyhow::anyhow;
+use cargo::core::{compiler::BuildConfig, Workspace};
+use cargo::ops::Packages;
+use cargo::util::{interning::InternedString, CliError, CliResult, Config};
+use cargo_travis::{build_kcov, CoverageOptions};
+use docopt::Docopt;
+use serde::Deserialize;
 use std::env;
 use std::path::Path;
-use cargo_travis::{CoverageOptions, build_kcov};
-use cargo::core::{compiler::BuildConfig, Workspace};
-use cargo::util::{Config, CliResult, CliError};
-use cargo::ops::{Packages};
-use docopt::Docopt;
-use failure::err_msg;
 
-pub const USAGE: &'static str = "
+pub const USAGE: &str = "
 Record coverage of `cargo test`, this runs all binaries that `cargo test` runs
 but not doc tests. The results of all tests are sent to coveralls.io
 
@@ -57,9 +49,9 @@ Test Options:
     --no-fail-fast               Run all tests regardless of failure
     --frozen                     Require Cargo.lock and cache are up to date
     --locked                     Require Cargo.lock is up to date
+    --offline                    Run without accessing the network
     -Z FLAG ...                  Unstable (nightly-only) flags to Cargo
 ";
-
 
 #[derive(Deserialize)]
 pub struct Options {
@@ -89,6 +81,7 @@ pub struct Options {
     flag_locked: bool,
     flag_all: bool,
     flag_exclude: Vec<String>,
+    flag_offline: bool,
     #[serde(rename = "flag_Z")]
     flag_z: Vec<String>,
 
@@ -98,8 +91,10 @@ pub struct Options {
 }
 
 fn execute(options: Options, config: &mut Config) -> CliResult {
-    debug!("executing; cmd=cargo-coveralls; args={:?}",
-           env::args().collect::<Vec<_>>());
+    debug!(
+        "executing; cmd=cargo-coveralls; args={:?}",
+        env::args().collect::<Vec<_>>()
+    );
 
     if options.flag_version {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -107,42 +102,56 @@ fn execute(options: Options, config: &mut Config) -> CliResult {
     }
 
     let kcov_path = build_kcov(options.flag_kcov_build_location);
+    let cli_config: Vec<String> = Vec::with_capacity(0);
     // TODO: build_kcov() - Might be a good idea to consider linking kcov as a
     // lib instead ?
-    try!(config.configure(options.flag_verbose,
-                          options.flag_quiet,
-                          &options.flag_color,
-                          options.flag_frozen,
-                          options.flag_locked,
-                          &None,
-                          &options.flag_z));
+    config.configure(
+        options.flag_verbose,
+        options.flag_quiet.unwrap_or(false),
+        options.flag_color.as_deref(),
+        options.flag_frozen,
+        options.flag_locked,
+        options.flag_offline,
+        &None,
+        &options.flag_z,
+        &cli_config,
+    )?;
 
     let ws = if let Some(path) = options.flag_manifest_path {
-        try!(Workspace::new(&Path::new(&path), config))
+        Workspace::new(&Path::new(&path), config)?
     } else {
-        let root = try!(cargo::util::important_paths::find_root_manifest_for_wd(config.cwd()));
-        try!(Workspace::new(&root, config))
+        let root = cargo::util::important_paths::find_root_manifest_for_wd(config.cwd())?;
+        Workspace::new(&root, config)?
     };
 
     let empty = vec![];
-    let (mode, filter) = (cargo::core::compiler::CompileMode::Test, cargo::ops::CompileFilter::new(
-        options.flag_lib,
-        options.flag_bin,
-        options.flag_bins,
-        options.flag_test,
-        options.flag_tests,
-        empty,
-        false,
-        options.flag_bench,
-        options.flag_benches,
-        options.flag_all_targets
-    ));
+    let (mode, filter) = (
+        cargo::core::compiler::CompileMode::Test,
+        cargo::ops::CompileFilter::from_raw_arguments(
+            options.flag_lib,
+            options.flag_bin,
+            options.flag_bins,
+            options.flag_test,
+            options.flag_tests,
+            empty,
+            false,
+            options.flag_bench,
+            options.flag_benches,
+            options.flag_all_targets,
+        ),
+    );
 
-    let spec = try!(Packages::from_flags(options.flag_all, options.flag_exclude, options.flag_package));
+    let spec = Packages::from_flags(options.flag_all, options.flag_exclude, options.flag_package)?;
+    let mut targets: Vec<String> = vec![];
+    if let Some(target) = &options.flag_target {
+        targets.push(target.to_string());
+    }
 
     // TODO: Force compilation target == host, kcov
-    let mut build_config = try!(BuildConfig::new(config, options.flag_jobs, &options.flag_target, mode));
-    build_config.release = options.flag_release;
+    let mut build_config = BuildConfig::new(config, options.flag_jobs, &targets, mode)?;
+    if options.flag_release {
+        build_config.requested_profile = InternedString::from("release");
+    }
 
     let job_id = std::env::var_os("TRAVIS_JOB_ID")
         .expect("Environment variable TRAVIS_JOB_ID not found. This should be run from Travis");
@@ -154,57 +163,54 @@ fn execute(options: Options, config: &mut Config) -> CliResult {
         exclude_pattern: options.flag_exclude_pattern,
         kcov_path: &kcov_path,
         compile_opts: cargo::ops::CompileOptions {
-            config: config,
-            build_config: build_config,
+            build_config,
             all_features: options.flag_all_features,
             features: options.flag_features,
             no_default_features: options.flag_no_default_features,
-            spec: spec,
-            filter: filter,
+            spec,
+            filter,
             target_rustdoc_args: None,
             target_rustc_args: None,
             local_rustdoc_args: None,
-            export_dir: None,
+            rustdoc_document_private_items: false,
         },
     };
 
-    let err = try!(cargo_travis::run_coverage(&ws, &ops, &options.arg_args));
+    let err = cargo_travis::run_coverage(&ws, &ops, &options.arg_args)?;
 
     match err {
         None => Ok(()),
-        Some(err) => {
-            Err(match err.exit.as_ref().and_then(|e| e.code()) {
-                Some(i) => CliError::new(err_msg("test failed"), i),
-                None => CliError::new(err.into(), 101)
-            })
-        }
+        Some(err) => Err(match err.exit.as_ref().and_then(|e| e.code()) {
+            Some(i) => CliError::new(anyhow!("test failed"), i),
+            None => CliError::new(err.into(), 101),
+        }),
     }
 }
 
 fn main() {
-    env_logger::init().unwrap();
+    env_logger::init();
     let mut config = match Config::default() {
         Ok(cfg) => cfg,
         Err(e) => {
-             let mut shell = cargo::core::Shell::new();
-             cargo::exit_with_error(e.into(), &mut shell)
+            let mut shell = cargo::core::Shell::new();
+            cargo::exit_with_error(e.into(), &mut shell)
         }
     };
     let result = (|| {
-        let args: Vec<_> = try!(env::args_os()
+        let args: Result<Vec<_>, _> = env::args_os()
             .map(|s| {
-                s.into_string().map_err(|s| {
-                    format_err!("invalid unicode in argument: {:?}", s)
-                })
+                s.into_string()
+                    .map_err(|s| anyhow!("invalid unicode in argument: {:?}", s))
             })
-            .collect());
+            .collect();
 
-        let docopt = Docopt::new(USAGE).unwrap()
-            .argv(args.iter().map(|s| &s[..]))
+        let docopt = Docopt::new(USAGE)
+            .unwrap()
+            .argv(args?.iter().map(|s| &s[..]))
             .help(true);
 
         let flags = docopt.deserialize().map_err(|e| {
-            let code = if e.fatal() {1} else {0};
+            let code = if e.fatal() { 1 } else { 0 };
             CliError::new(e.into(), code)
         })?;
 

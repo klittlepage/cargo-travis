@@ -1,23 +1,15 @@
-extern crate cargo;
-extern crate cargo_travis;
-extern crate docopt;
-extern crate env_logger;
-#[macro_use]
-extern crate failure;
-#[macro_use]
-extern crate serde_derive;
-#[macro_use]
-extern crate log;
+use log::debug;
 
+use anyhow::anyhow;
+use cargo::util::{CliError, CliResult, Config};
+use docopt::Docopt;
+use serde::Deserialize;
 use std::env;
 use std::path::{Path, PathBuf};
-use cargo::util::{Config, CliResult, CliError};
-use docopt::Docopt;
-use failure::err_msg;
 
 // Note about --path: we don't use the proper default syntax because the default
 // value depends on an env variable.
-pub const USAGE: &'static str = "
+pub const USAGE: &str = "
 Upload built rustdoc documentation to GitHub pages.
 
 Usage:
@@ -50,8 +42,10 @@ pub struct Options {
 }
 
 fn execute(options: Options, _: &Config) -> CliResult {
-    debug!("executing; cmd=cargo-doc-upload; env={:?}",
-           env::args().collect::<Vec<_>>());
+    debug!(
+        "executing; cmd=cargo-doc-upload; env={:?}",
+        env::args().collect::<Vec<_>>()
+    );
 
     if options.flag_version {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
@@ -79,7 +73,7 @@ fn execute(options: Options, _: &Config) -> CliResult {
     let path = options.flag_path.unwrap_or_else(|| branch.clone());
 
     // TODO FEAT: Allow passing origin string
-    let token = options.flag_token.or(env::var("GH_TOKEN").ok());
+    let token = options.flag_token.or_else(|| env::var("GH_TOKEN").ok());
     let slug = env::var("TRAVIS_REPO_SLUG").expect("$TRAVIS_REPO_SLUG not set");
     let origin = if let Some(token) = token {
         format!("https://{}@github.com/{}.git", token, slug)
@@ -89,22 +83,34 @@ fn execute(options: Options, _: &Config) -> CliResult {
         format!("git@github.com:{}.git", slug)
     };
 
-    let message = options.flag_message.unwrap_or("Automatic Travis documentation build".to_string());
-    let gh_pages = options.flag_deploy.unwrap_or("gh-pages".to_string());
+    let message = options
+        .flag_message
+        .unwrap_or_else(|| "Automatic Travis documentation build".to_string());
+    let gh_pages = options
+        .flag_deploy
+        .unwrap_or_else(|| "gh-pages".to_string());
     let clobber_index = options.flag_clobber_index;
 
-    let local_doc_path = options.flag_target
+    let local_doc_path = options
+        .flag_target
         .map(|v| Path::new("target").join(v).join("doc"))
-        .unwrap_or(PathBuf::from("target/doc"));
+        .unwrap_or_else(|| PathBuf::from("target/doc"));
 
-    match cargo_travis::doc_upload(&message, &origin, &gh_pages, &path, &local_doc_path, clobber_index) {
+    match cargo_travis::doc_upload(
+        &message,
+        &origin,
+        &gh_pages,
+        &path,
+        &local_doc_path,
+        clobber_index,
+    ) {
         Ok(..) => Ok(()),
-        Err((string, err)) => Err(CliError::new(err_msg(string), err)),
+        Err((string, err)) => Err(CliError::new(anyhow!(string), err)),
     }
 }
 
 fn main() {
-    env_logger::init().unwrap();
+    env_logger::init();
     let config = match Config::default() {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -113,20 +119,20 @@ fn main() {
         }
     };
     let result = (|| {
-        let args: Vec<_> = try!(env::args_os()
+        let args: Result<Vec<_>, _> = env::args_os()
             .map(|s| {
-                s.into_string().map_err(|s| {
-                    format_err!("invalid unicode in argument: {:?}", s)
-                })
+                s.into_string()
+                    .map_err(|s| anyhow!("invalid unicode in argument: {:?}", s))
             })
-            .collect());
+            .collect();
 
-        let docopt = Docopt::new(USAGE).unwrap()
-            .argv(args.iter().map(|s| &s[..]))
+        let docopt = Docopt::new(USAGE)
+            .unwrap()
+            .argv(args?.iter().map(|s| &s[..]))
             .help(true);
 
         let flags = docopt.deserialize().map_err(|e| {
-            let code = if e.fatal() {1} else {0};
+            let code = if e.fatal() { 1 } else { 0 };
             CliError::new(e.into(), code)
         })?;
 
